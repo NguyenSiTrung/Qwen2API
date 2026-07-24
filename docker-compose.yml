@@ -2,14 +2,14 @@ services:
   qwen2api:
     container_name: qwen2api
     build:
-      context: ..
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: docker/Dockerfile
     image: qwen2api:local
     restart: always
     env_file:
-      - ../.env
+      - .env
     ports:
       - "3000:3000"
     volumes:
-      - ../data:/app/data
-      - ../logs:/app/logs
+      - ./data:/app/data
+      - ./logs:/app/logs
