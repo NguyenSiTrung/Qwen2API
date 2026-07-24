@@ -190,20 +190,8 @@ class DataPersistence {
       return []
     }
 
-    const { parseAccountLine } = require('./account-parser')
-    const accountTokens = process.env.ACCOUNTS.split(',')
-    const accounts = []
-
-    // 解析委托给共用 parser，与后台批量添加保持一致；
-    // 注意：这里仅加载凭据，token 在 Account 类中按需登录获取
-    for (const item of accountTokens) {
-      const parsed = parseAccountLine(item)
-      if (parsed) {
-        accounts.push({ ...parsed, token: null, expires: null })
-      }
-    }
-
-    return accounts
+    const { parseAccountsEnv } = require('./account-parser')
+    return parseAccountsEnv(process.env.ACCOUNTS)
   }
 
   /**

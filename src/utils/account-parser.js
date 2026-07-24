@@ -39,6 +39,94 @@ const parseAccountLine = (line) => {
   return { email, password, proxy }
 }
 
-module.exports = {
-  parseAccountLine
+/**
+ * 判断一个 chunk 是否代表一个新账号条目的开头
+ * @param {string} str
+ * @returns {boolean}
+ */
+const isNewAccountEntry = (str) => {
+  if (!str) return false
+  const trimmed = str.trim()
+  const pipeIdx = trimmed.indexOf('|')
+  const creds = pipeIdx === -1 ? trimmed : trimmed.slice(0, pipeIdx)
+  const colonIdx = creds.indexOf(':')
+  if (colonIdx === -1) return false
+  const potentialEmail = creds.slice(0, colonIdx).trim()
+  return potentialEmail.length > 0 && !/\s/.test(potentialEmail) && !/[;,]/.test(potentialEmail)
 }
+
+/**
+ * 将完整的 ACCOUNTS 环境变量或多行账号文本智能切分成独立的账号条目字符串数组
+ * 能够智能识别密码中包含逗号 (,) 或分号 (;) 的情况
+ * @param {string} rawText
+ * @returns {string[]}
+ */
+const splitAccountEntries = (rawText) => {
+  if (typeof rawText !== 'string' || !rawText.trim()) return []
+
+  const lines = rawText
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean)
+
+  const entries = []
+
+  for (const line of lines) {
+    if (!line.includes(',') && !line.includes(';')) {
+      entries.push(line)
+      continue
+    }
+
+    const chunks = line.split(/([,;])/)
+    let currentEntry = ''
+
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i]
+      if (chunk === ',' || chunk === ';') continue
+
+      if (!currentEntry) {
+        currentEntry = chunk
+      } else if (isNewAccountEntry(chunk)) {
+        entries.push(currentEntry)
+        currentEntry = chunk
+      } else {
+        const delim = chunks[i - 1] || ','
+        currentEntry += delim + chunk
+      }
+    }
+
+    if (currentEntry) {
+      entries.push(currentEntry)
+    }
+  }
+
+  return entries
+}
+
+/**
+ * 从 ACCOUNTS 环境变量解析所有账号结构数组
+ * @param {string} envAccounts
+ * @returns {Array<{ email: string, password: string, proxy: string|null, token: null, expires: null }>}
+ */
+const parseAccountsEnv = (envAccounts) => {
+  const rawEntries = splitAccountEntries(envAccounts)
+  const accounts = []
+
+  for (const item of rawEntries) {
+    const parsed = parseAccountLine(item)
+    if (parsed) {
+      accounts.push({ ...parsed, token: null, expires: null })
+    }
+  }
+
+  return accounts
+}
+
+module.exports = {
+  parseAccountLine,
+  isNewAccountEntry,
+  splitAccountEntries,
+  parseAccountsEnv
+}
+

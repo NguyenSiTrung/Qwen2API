@@ -6,7 +6,7 @@ const { logger } = require('../utils/logger')
 const { JwtDecode } = require('../utils/tools')
 const { adminKeyVerify } = require('../middlewares/authorization')
 const { deleteAccount, saveAccounts, refreshAccountToken } = require('../utils/setting')
-const { parseAccountLine } = require('../utils/account-parser')
+const { parseAccountLine, splitAccountEntries } = require('../utils/account-parser')
 const { isValidProxyUrl } = require('../utils/proxy-helper')
 const { DEFAULT_CLI_QUOTA_LIMIT, getAccountCliState } = require('../utils/cli-support')
 
@@ -42,11 +42,7 @@ const scheduleBatchTaskCleanup = (taskId) => {
  * @returns {{ accountLines: string[], parsedAccounts: Array<{ email: string, password: string, proxy: string|null }>, invalidCount: number }} 解析结果
  */
 const parseBatchAccountsText = (accountsText) => {
-  const normalizedText = String(accountsText).replace(/[\r]/g, '\n')
-  const accountLines = normalizedText
-    .split('\n')
-    .map(item => item.trim())
-    .filter(item => item !== '')
+  const accountLines = splitAccountEntries(String(accountsText))
 
   const parsedAccounts = []
   let invalidCount = 0
