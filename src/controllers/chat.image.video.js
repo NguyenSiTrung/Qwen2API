@@ -7,37 +7,12 @@ const { generateChatID } = require('../utils/request.js')
 const { uploadFileToQwenOss } = require('../utils/upload.js')
 const { parserModel } = require('../utils/chat-helpers.js')
 const { getDefaultModelByChatType } = require('../models/models-map.js')
-const { getSsxmodItna, getSsxmodItna2 } = require('../utils/ssxmod-manager')
-const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('../utils/proxy-helper')
+const { getSsxmodForAccount } = require('../utils/ssxmod-manager')
+const { applyProxyToAxiosConfig, getChatBaseUrl } = require('../utils/proxy-helper');
+const { buildRequestHeaders } = require('../utils/header-profile')
 
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
 const HTTP_URL_REGEX = /^https?:\/\//i
-
-/**
- * 构造与当前账号一致的上游 Cookie 头
- * @param {string} token - 当前账号令牌
- * @returns {string} Cookie 头
- */
-const buildUpstreamCookieHeader = (token) => {
-    const cookieParts = []
-
-    if (token) {
-        cookieParts.push(`token=${token}`)
-    }
-
-    const ssxmodItna = getSsxmodItna()
-    const ssxmodItna2 = getSsxmodItna2()
-
-    if (ssxmodItna) {
-        cookieParts.push(`ssxmod_itna=${ssxmodItna}`)
-    }
-
-    if (ssxmodItna2) {
-        cookieParts.push(`ssxmod_itna2=${ssxmodItna2}`)
-    }
-
-    return cookieParts.join('; ')
-}
 
 /**
  * 将上游响应体格式化为便于日志输出的对象
@@ -278,7 +253,7 @@ const extractResponseIDsFromText = (text) => {
     ]
 
     for (const pattern of patterns) {
-        let matched = null
+        let matched
         while ((matched = pattern.exec(text)) !== null) {
             const responseID = matched[1]?.trim()
             if (responseID && !responseIDs.includes(responseID)) {
@@ -538,13 +513,6 @@ const extractVideoTaskIdentifiersFromPayload = (payload) => {
 }
 
 /**
- * 从上游响应中提取首个视频任务 ID
- * @param {*} payload - 上游响应负载
- * @returns {string|null} 视频任务 ID
- */
-const extractVideoTaskIDFromPayload = (payload) => extractVideoTaskIdentifiersFromPayload(payload)[0] || null
-
-/**
  * 判断是否属于可重试的上游生成错误
  * @param {object|null} upstreamError - 上游错误
  * @returns {boolean} 是否可重试
@@ -664,16 +632,12 @@ const sendOpenAIErrorResponse = (res, error) => {
  * @returns {Promise<string>} Base64 内容
  */
 const downloadAssetAsBase64 = async (contentUrl, account) => {
-    const proxyAgent = getProxyAgent(account)
     const requestConfig = {
         responseType: 'arraybuffer',
         timeout: 1000 * 60 * 2
     }
 
-    if (proxyAgent) {
-        requestConfig.httpsAgent = proxyAgent
-        requestConfig.proxy = false
-    }
+    applyProxyToAxiosConfig(requestConfig, account);
 
     const responseData = await axios.get(contentUrl, requestConfig)
     return Buffer.from(responseData.data).toString('base64')
@@ -1035,22 +999,23 @@ const getChatDetail = async (chatID, token) => {
         const chatBaseUrl = getChatBaseUrl()
         // 通过 token 反查 account 解析账号级代理（找不到则回退到全局 PROXY_URL）
         const account = accountManager.getAccountByToken(token)
-        const proxyAgent = getProxyAgent(account)
-        const cookieHeader = buildUpstreamCookieHeader(token)
+        // Antidetect: per-account fingerprint headers replace static block
+        const ssxmod = getSsxmodForAccount(account)
+        const headers = buildRequestHeaders(account, {
+            chatBaseUrl,
+            token,
+            ssxmodItna: ssxmod.ssxmod_itna,
+            ssxmodItna2: ssxmod.ssxmod_itna2,
+            extra: {
+                'Authorization': `Bearer ${token}`
+            }
+        })
 
         const requestConfig = {
-            headers: {
-                "Authorization": `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                ...(cookieHeader && { 'Cookie': cookieHeader })
-            }
+            headers
         }
 
-        if (proxyAgent) {
-            requestConfig.httpsAgent = proxyAgent
-            requestConfig.proxy = false
-        }
+        applyProxyToAxiosConfig(requestConfig, account);
 
         const responseData = await axios.get(`${chatBaseUrl}/api/v2/chats/${chatID}`, requestConfig)
         return responseData.data || null
@@ -1361,8 +1326,19 @@ const generateImageVideoResult = async (payload) => {
         }
 
         const chatBaseUrl = getChatBaseUrl()
-        const proxyAgent = getProxyAgent(account)
-        const cookieHeader = buildUpstreamCookieHeader(token)
+        // Antidetect: per-account fingerprint headers replace static block
+        const ssxmod = getSsxmodForAccount(account)
+        const headers = buildRequestHeaders(account, {
+            chatBaseUrl,
+            token,
+            ssxmodItna: ssxmod.ssxmod_itna,
+            ssxmodItna2: ssxmod.ssxmod_itna2,
+            accept: upstreamStream ? 'application/json, text/plain, */*' : 'application/json',
+            extra: {
+                'authorization': `Bearer ${token}`,
+                'bx-v': '2.5.36'
+            }
+        })
 
         logger.info('发送图片视频请求', 'CHAT')
         logger.info(`选择图片: ${selectedImageList[selectedImageList.length - 1] || '未选择图片，切换生成图/视频模式'}`, 'CHAT')
@@ -1375,33 +1351,12 @@ const generateImageVideoResult = async (payload) => {
         logger.info(`图片视频流策略: upstream=${upstreamStream} downstream=${payload.stream === true}`, 'CHAT')
 
         const requestConfig = {
-            headers: {
-                'authorization': `Bearer ${token}`,
-                'sec-ch-ua-platform': '"Windows"',
-                'referer': `${chatBaseUrl}/`,
-                'accept-language': 'zh-CN,zh;q=0.9',
-                'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
-                'sec-ch-ua-mobile': '?0',
-                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
-                'content-type': 'application/json',
-                'bx-v': '2.5.36',
-                'accept': upstreamStream ? 'application/json, text/plain, */*' : 'application/json',
-                'accept-encoding': 'gzip, deflate, br, zstd',
-                ...(cookieHeader && { 'cookie': cookieHeader }),
-                'host': chatBaseUrl.replace('https://', ''),
-                'origin': chatBaseUrl,
-                'sec-fetch-dest': 'empty',
-                'sec-fetch-mode': 'cors',
-                'sec-fetch-site': 'same-origin',
-            },
+            headers,
             responseType: newChatType === 't2v' ? 'json' : (upstreamStream ? 'stream' : 'text'),
             timeout: 1000 * 60 * 5
         }
 
-        if (proxyAgent) {
-            requestConfig.httpsAgent = proxyAgent
-            requestConfig.proxy = false
-        }
+        applyProxyToAxiosConfig(requestConfig, account);
 
         let responseData = null
         const maxUpstreamAttempts = 2
@@ -1723,152 +1678,28 @@ const handleOpenAIVideoGeneration = async (req, res) => {
     }
 }
 
-const handleVideoCompletion = async (res, responseStream, token, model, downstreamStream, chatID) => {
-    let keepAliveTimer = null
-
-    try {
-        if (downstreamStream) {
-            setResponseHeaders(res, true)
-            keepAliveTimer = setInterval(() => {
-                if (!res.writableEnded) {
-                    res.write(`: keep-alive\n\n`)
-                }
-            }, 15000)
-        }
-
-        const { upstreamError, contentUrl: upstreamContentUrl, videoTaskID, videoTaskCandidates, responseIDs, rawPreview } = await readVideoUpstreamResult(responseStream)
-        if (upstreamError) {
-            if (keepAliveTimer) {
-                clearInterval(keepAliveTimer)
-            }
-
-            if (downstreamStream) {
-                res.status(upstreamError.status || 500)
-                return returnResponse(res, model, upstreamError.error || '视频生成失败', true)
-            }
-
-            return sendUpstreamError(res, upstreamError)
-        }
-
-        if (upstreamContentUrl) {
-            if (keepAliveTimer) {
-                clearInterval(keepAliveTimer)
-            }
-
-            return returnResponse(res, model, buildVideoContent(upstreamContentUrl), downstreamStream)
-        }
-
-        let resolvedContentUrl = upstreamContentUrl
-        let resolvedTaskCandidates = [...videoTaskCandidates]
-
-        if (!resolvedContentUrl && resolvedTaskCandidates.length === 0 && chatID) {
-            logger.info(`视频上游未直接返回任务信息，尝试从聊天详情补取，chat_id=${chatID} responseIDs=${JSON.stringify(responseIDs)}`, 'CHAT')
-
-            for (let attempt = 1; attempt <= 5; attempt++) {
-                const chatDetail = await getChatDetail(chatID, token)
-                const extractedInfo = extractVideoInfoFromChatDetail(chatDetail, responseIDs)
-
-                if (!resolvedContentUrl && extractedInfo.contentUrl) {
-                    resolvedContentUrl = extractedInfo.contentUrl
-                }
-
-                for (const taskID of extractedInfo.videoTaskCandidates) {
-                    if (!resolvedTaskCandidates.includes(taskID)) {
-                        resolvedTaskCandidates.push(taskID)
-                    }
-                }
-
-                if (resolvedContentUrl || resolvedTaskCandidates.length > 0) {
-                    break
-                }
-
-                await sleep(1200)
-            }
-        }
-
-        if (resolvedContentUrl) {
-            if (keepAliveTimer) {
-                clearInterval(keepAliveTimer)
-            }
-
-            return returnResponse(res, model, buildVideoContent(resolvedContentUrl), downstreamStream)
-        }
-
-        if (resolvedTaskCandidates.length === 0) {
-            logger.warn(`视频上游响应未解析出任务信息，contentUrl=${resolvedContentUrl || '空'} candidates=${JSON.stringify(resolvedTaskCandidates)} responseIDs=${JSON.stringify(responseIDs)} preview=${rawPreview}`, 'CHAT')
-            throw new Error('上游未返回视频任务 ID 或视频链接')
-        }
-
-        logger.info(`视频任务候选ID: ${JSON.stringify(resolvedTaskCandidates)}`, 'CHAT')
-
-        const maxAttempts = 60
-        const delay = 20 * 1000
-
-        for (const taskCandidate of resolvedTaskCandidates) {
-            logger.info(`开始轮询视频任务ID: ${taskCandidate}`, 'CHAT')
-
-            for (let i = 0; i < maxAttempts; i++) {
-                const content = await getVideoTaskStatus(taskCandidate, token)
-                if (content) {
-                    if (keepAliveTimer) {
-                        clearInterval(keepAliveTimer)
-                    }
-
-                    return returnResponse(res, model, buildVideoContent(content), downstreamStream)
-                }
-
-                await sleep(delay)
-            }
-        }
-
-        logger.error(`视频任务 ${JSON.stringify(resolvedTaskCandidates)} 轮询超时`, 'CHAT')
-        if (keepAliveTimer) {
-            clearInterval(keepAliveTimer)
-        }
-
-        if (downstreamStream) {
-            return returnResponse(res, model, '视频生成超时，请稍后再试', true)
-        }
-
-        return res.status(504).json({ error: '视频生成超时，请稍后再试' })
-    } catch (error) {
-        if (keepAliveTimer) {
-            clearInterval(keepAliveTimer)
-        }
-
-        logger.error('获取视频任务状态失败', 'CHAT', '', error)
-
-        const errorMessage = error.response?.data?.data?.code || error.message || '可能该帐号今日生成次数已用完'
-
-        if (downstreamStream) {
-            return returnResponse(res, model, `视频生成失败: ${errorMessage}`, true)
-        }
-
-        res.status(500).json({ error: errorMessage })
-    }
-}
 
 const getVideoTaskStatus = async (videoTaskID, token) => {
     try {
         const chatBaseUrl = getChatBaseUrl()
         const account = accountManager.getAccountByToken(token)
-        const proxyAgent = getProxyAgent(account)
-        const cookieHeader = buildUpstreamCookieHeader(token)
+        // Antidetect: per-account fingerprint headers replace static block
+        const ssxmod = getSsxmodForAccount(account)
+        const headers = buildRequestHeaders(account, {
+            chatBaseUrl,
+            token,
+            ssxmodItna: ssxmod.ssxmod_itna,
+            ssxmodItna2: ssxmod.ssxmod_itna2,
+            extra: {
+                'Authorization': `Bearer ${token}`
+            }
+        })
 
         const requestConfig = {
-            headers: {
-                "Authorization": `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                ...(cookieHeader && { 'Cookie': cookieHeader })
-            }
+            headers
         }
 
-        // 添加代理配置
-        if (proxyAgent) {
-            requestConfig.httpsAgent = proxyAgent
-            requestConfig.proxy = false
-        }
+        applyProxyToAxiosConfig(requestConfig, account);
 
         const response_data = await axios.get(`${chatBaseUrl}/api/v1/tasks/status/${videoTaskID}`, requestConfig)
 

@@ -26,6 +26,8 @@ const config = {
     adminKey: adminKey,
     batchLoginConcurrency: Math.max(1, parseInt(process.env.BATCH_LOGIN_CONCURRENCY) || 5),
     simpleModelMap: process.env.SIMPLE_MODEL_MAP === 'true' ? true : false,
+    // 入站模型名映射原文：alias=target,...,*=fallback（见 src/utils/model-map.js，每次请求重新解析）
+    modelMap: process.env.MODEL_MAP || '',
     // 模型列表缓存有效期（秒），过期后下次请求自动刷新；0 = 永不过期（旧版行为）
     modelsCacheTtl: process.env.MODELS_CACHE_TTL !== undefined ? Math.max(0, parseInt(process.env.MODELS_CACHE_TTL, 10) || 0) : 3600,
     listenAddress: process.env.LISTEN_ADDRESS || null,
@@ -59,6 +61,13 @@ const config = {
         6,
         Math.max(2, parseInt(process.env.AGENT_TURN_MAX_ATTEMPTS, 10) || 3)
     ),
+    // Anthropic 与 OpenAI 两条路径共用：一轮 attempt 里文本通道工具调用的上限（默认 24，钳在 4..256）。
+    // 模型在叙述的 [TOOL CALL] 之后失控（同一调用重复上百次 / 幻想整段 agent 会话）时，
+    // 第 N 个已放行的调用之后立刻终止上游；非数字按默认处理，越界钳位而非回退默认。
+    agentTurnMaxToolCalls: (() => {
+        const raw = parseInt(process.env.AGENT_TURN_MAX_TOOL_CALLS, 10)
+        return Number.isFinite(raw) ? Math.min(256, Math.max(4, raw)) : 24
+    })(),
     // 面向 Anthropic 风格客户端的回合门禁放宽开关，默认关闭，严格模式行为不变。
     // Anthropic Messages API 允许同一条 assistant 消息同时携带 text 与 tool_use，
     // 所以一个完全合规的 Anthropic 客户端在严格模式下反而会被判为无效回合。
@@ -74,6 +83,57 @@ const config = {
     agentContextLivePromptBytes: Math.max(
         8 * 1024,
         parseInt(process.env.AGENT_CONTEXT_LIVE_PROMPT_BYTES, 10) || 48 * 1024
+    ),
+    // Presupuesto del fallback cuando el adjunto falla y la peticion NO lleva tools
+    // (con tools no se compacta: se responde 529/503 reintentable). Mas holgado que el
+    // live prompt porque aqui no hay adjunto que complete el resto.
+    agentContextFallbackPromptBytes: Math.max(
+        8 * 1024,
+        parseInt(process.env.AGENT_CONTEXT_FALLBACK_PROMPT_BYTES, 10) || 84 * 1024
+    ),
+    // Cortacircuitos del parse de adjuntos (src/utils/upload.js): tras 3 desafios WAF
+    // seguidos no se sube nada durante estos segundos y el 529 lleva ese Retry-After.
+    // 0 lo desactiva.
+    agentParseBreakerSeconds: (() => {
+        const raw = parseInt(process.env.AGENT_PARSE_BREAKER_SECONDS, 10)
+        return Number.isFinite(raw) && raw >= 0 ? raw : 300
+    })(),
+    // Limitador de ritmo del parse (src/utils/upload.js): como maximo MAX upload+parse por
+    // ventana de WINDOW segundos por proceso; el resto recibe 529 con Retry-After corto
+    // ANTES de que el WAF (que cuenta por IP) empiece a desafiar. Medido 2026-09-10:
+    // 10 en 150 s disparan el desafio. MAX = 0 lo desactiva.
+    agentParseMaxPerWindow: (() => {
+        const raw = parseInt(process.env.AGENT_PARSE_MAX_PER_WINDOW, 10)
+        return Number.isFinite(raw) && raw >= 0 ? raw : 6
+    })(),
+    agentParseWindowSeconds: (() => {
+        const raw = parseInt(process.env.AGENT_PARSE_WINDOW_SECONDS, 10)
+        return Number.isFinite(raw) && raw > 0 ? raw : 120
+    })(),
+    // Reutilizacion del prefijo de historial entre turnos (src/utils/context-prefix-cache.js):
+    // el historial ya subido y parseado viaja como el mismo adjunto y solo la cola nueva va
+    // inline — un parse cada 3-10 turnos en vez de uno por turno. 'false' lo apaga.
+    agentContextPrefixReuse: process.env.AGENT_CONTEXT_PREFIX_REUSE !== 'false',
+    // Vida ABSOLUTA de una entrada (desde que se subio). Un file_id caducado en Qwen no da
+    // error: el modelo contesta sin el adjunto (medido 2026-09-10), asi que el TTL es la
+    // unica cota contra un historial fantasma.
+    agentContextPrefixTtlSeconds: (() => {
+        const raw = parseInt(process.env.AGENT_CONTEXT_PREFIX_TTL_SECONDS, 10)
+        return Number.isFinite(raw) && raw > 0 ? raw : 1800
+    })(),
+    agentContextPrefixMaxEntries: (() => {
+        const raw = parseInt(process.env.AGENT_CONTEXT_PREFIX_MAX_ENTRIES, 10)
+        return Number.isFinite(raw) && raw > 0 ? raw : 200
+    })(),
+    // Antidetect Tier 1: per-account fingerprint & header diversity.
+    // Set to 'false' to instantly roll back to legacy static headers.
+    antidetectTier1Enabled: process.env.ANTIDETECT_TIER1_ENABLED !== 'false',
+    // Anthropic SSE `ping` cadence during upstream silence. Lower it if a client
+    // or reverse proxy gives up sooner than this; the compensation retry can hold
+    // the stream for tens of seconds with nothing else to send.
+    anthropicPingIntervalMs: Math.max(
+        1000,
+        parseInt(process.env.ANTHROPIC_PING_INTERVAL_MS, 10) || 15000
     )
 }
 

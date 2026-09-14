@@ -1,19 +1,29 @@
 const { isJson, generateUUID } = require('../utils/tools.js')
 const { createUsageObject } = require('../utils/precise-tokenizer.js')
 const { sendChatRequest } = require('../utils/request.js')
+const { buildContextPrefixKey } = require('../utils/context-prefix-cache.js')
 const {
     createToolCallStreamParser,
     parseToolCallsFromText,
     createNativeToolCallAccumulator,
-    looksLikeUnexecutedToolAction
+    looksLikeUnexecutedToolAction,
+    stripToolCallResidue,
+    TOOL_CALL_OPEN,
+    TOOL_CALL_CLOSE
 } = require('../utils/tool-prompt.js')
+const { stripAgentTags } = require('../utils/agent-turn.js')
 const { consumeSSEStream, createUpstreamResponseFilter } = require('../utils/sse.js')
 const accountManager = require('../utils/account.js')
 const config = require('../config/index.js')
 const { logger } = require('../utils/logger')
-const { createUpstreamDeltaNormalizer } = require('../utils/chat-helpers.js')
-const { assertNoUpstreamFailure } = require('../utils/upstream-error.js')
-const { runOpenAIAgentTurn } = require('../utils/openai-agent-runtime.js')
+const { createUpstreamDeltaNormalizer, createClientToolNamePredicate } = require('../utils/chat-helpers.js')
+const {
+    assertNoUpstreamFailure,
+    describeUpstreamFailure,
+    noteRateLimitedAccount,
+    RATE_LIMIT_OPENAI_TYPE
+} = require('../utils/upstream-error.js')
+const { runOpenAIAgentTurn, feedNativeFrame } = require('../utils/openai-agent-runtime.js')
 
 const normalizeOpenAIFinishReason = (upstreamReason, hasToolCalls, upstreamCompleted) => {
     if (hasToolCalls) return 'tool_calls'
@@ -30,14 +40,14 @@ const normalizeOpenAIFinishReason = (upstreamReason, hasToolCalls, upstreamCompl
     return upstreamCompleted ? 'stop' : null
 }
 
-const writeOpenAIStreamError = (res, message, code = 'upstream_incomplete') => {
-    res.write(`data: ${JSON.stringify({
-        error: {
-            message,
-            type: 'upstream_stream_error',
-            code
-        }
-    })}\n\n`)
+const writeOpenAIStreamError = (res, message, code = 'upstream_incomplete', type = 'upstream_stream_error', retryAfterSeconds = null) => {
+    const error = { message, type, code }
+    // Gemelo de anthropic.js#writeAnthropicError: con las cabeceras ya enviadas no hay
+    // Retry-After que poner, asi que la espera real viaja dentro del frame o se pierde.
+    if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+        error.retry_after = retryAfterSeconds
+    }
+    res.write(`data: ${JSON.stringify({ error })}\n\n`)
     res.write('data: [DONE]\n\n')
     if (typeof res.flush === 'function') res.flush()
     res.end()
@@ -101,20 +111,20 @@ const requiresToolCall = (toolChoice) => {
  */
 const buildRequiredRetryHint = (toolChoice) => {
     if (toolChoice && typeof toolChoice === 'object' && toolChoice.function?.name) {
-        return `You did not call any tool in your previous reply. You MUST now call the tool \`${toolChoice.function.name}\` using the <tool_call>...</tool_call> format and nothing else.`
+        return `You did not call any tool in your previous reply. You MUST now call the tool \`${toolChoice.function.name}\` using the ${TOOL_CALL_OPEN}...${TOOL_CALL_CLOSE} format and nothing else.`
     }
-    return 'You did not call any tool in your previous reply. You MUST now call exactly one tool using the <tool_call>...</tool_call> format and nothing else.'
+    return `You did not call any tool in your previous reply. You MUST now call exactly one tool using the ${TOOL_CALL_OPEN}...${TOOL_CALL_CLOSE} format and nothing else.`
 }
 
 const buildEmptyOutputRetryHint = () => [
     'Your previous reply produced no visible final answer or executable tool call.',
-    'Continue the Agent task now. If any action remains, emit the required `<tool_call>` block immediately with no preamble.',
+    `Continue the Agent task now. If any action remains, emit the required \`${TOOL_CALL_OPEN}\` block immediately with no preamble.`,
     'Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning.'
 ].join(' ')
 
 const buildMissingToolRetryHint = () => [
     'Your previous reply described an action but did not execute any tool call.',
-    'Perform that action now by emitting the real `<tool_call>` block immediately with no preamble.',
+    `Perform that action now by emitting the real \`${TOOL_CALL_OPEN}\` block immediately with no preamble.`,
     'Do not describe the action again or claim completion without a tool result.'
 ].join(' ')
 
@@ -172,19 +182,59 @@ const writeOpenAIHttpError = (res, error = {}) => {
     const status = Number(error.status) || 502
     const message = error.message || '上游未能生成有效响应'
     const code = error.code || 'upstream_error'
+    const type = error.type || (status === 429 ? 'rate_limit_error' : 'upstream_error')
     if (res.headersSent) {
-        if (!res.writableEnded) writeOpenAIStreamError(res, message, code)
+        // A media transmision el status ya se fue: el `type` del frame es lo unico que le
+        // queda al cliente para distinguir cuota de averia. Fuera de la cuota, el frame
+        // conserva su etiqueta de siempre (`upstream_stream_error`, pinchada en
+        // tests/agent-protocol.test.js:210 por su `code`).
+        if (!res.writableEnded) {
+            // La espera baja al frame por la misma razon que el `type`: la cabecera
+            // Retry-After ya no existe en esta fase.
+            writeOpenAIStreamError(
+                res, message, code, error.type || 'upstream_stream_error', Number(error.retry_after) || null
+            )
+        }
         return
     }
+    // Solo con una espera que mando el upstream de verdad (utils/upstream-error.js).
+    if (Number(error.retry_after) > 0) res.set({ 'Retry-After': String(error.retry_after) })
     res.status(status)
     res.set({ 'Content-Type': 'application/json' })
     res.json({
         error: {
             message,
-            type: status === 429 ? 'rate_limit_error' : 'upstream_error',
+            type,
             code
         }
     })
+}
+
+/**
+ * Traduce un fallo de upstream a la forma de cable de OpenAI. La cuota diaria agotada es
+ * 429 `insufficient_quota` como en la API nativa — no un 502 `upstream_error`, con el que
+ * un cliente agentico no puede distinguir "sin cuota" de "servidor roto" y reintenta
+ * contra un muro. Gemelo: anthropic.js (429 `rate_limit_error`). La deteccion es unica,
+ * en utils/upstream-error.js#describeUpstreamFailure.
+ * @param {Error} error - Error capturado
+ * @param {string} fallbackMessage - Mensaje cuando el error no trae `publicMessage`
+ * @param {string} [fallbackCode] - `code` cuando el error no trae uno
+ * @returns {{status: number, message: string, code: string, type?: string, retry_after?: number}}
+ */
+const upstreamErrorShape = (error, fallbackMessage, fallbackCode = 'upstream_error') => {
+    // 529 es un status de Anthropic; en el cable OpenAI el adjunto caido es 503.
+    const failure = describeUpstreamFailure(error, 502, 503)
+    const shape = {
+        status: failure.status,
+        message: error?.publicMessage || fallbackMessage,
+        code: failure.rateLimited
+            ? RATE_LIMIT_OPENAI_TYPE
+            : (failure.overloaded ? 'upstream_unavailable' : (error?.code || fallbackCode))
+    }
+    if (failure.rateLimited) shape.type = RATE_LIMIT_OPENAI_TYPE
+    else if (failure.overloaded) shape.type = 'server_error'
+    if (failure.retryAfter !== null) shape.retry_after = failure.retryAfter
+    return shape
 }
 
 const runWithProcessingHeartbeat = async (res, work, intervalMs = 15000) => {
@@ -240,9 +290,66 @@ const normalizeAgentUsage = (attempt, requestBody, completionText) => {
     return usage
 }
 
-const prepareAgentOutput = async (attempt, enableThinking, enableWebSearch) => {
+/**
+ * Residuo de protocolo que TODAVÍA se puede pelar en la entrega.
+ *
+ * Lo que ya salió en vivo por el canal de contenido es irrecuperable, y borrarlo del buffer
+ * rompería el descuento de handleOpenAIAgentStream (`bufferedContent.startsWith(...)`) y lo
+ * duplicaría en el cliente: un residuo entregado una vez es mejor que la respuesta entera
+ * entregada dos. Hoy ninguna ronda aceptada llega aquí con texto ya emitido y residuo a la
+ * vez (el gate 422 corta antes), así que este filtro es defensa, no un camino vivo.
+ */
+const deliverableResidueSpans = (attempt, alreadyStreamed = 0) =>
+    (attempt?.residueSpans || []).filter(span =>
+        span && typeof span.text === 'string' && Number.isInteger(span.at) && span.at >= alreadyStreamed)
+
+/**
+ * Pelado de ENTREGA, gemelo literal de anthropic.js:2278.
+ *
+ * Orden obligatorio: primero el residuo por POSICIÓN —sobre el texto crudo, que es el
+ * sistema de coordenadas en el que el parser registró los spans— y sólo después las
+ * etiquetas de control. Al revés, quitar las etiquetas desplazaría los offsets y el residuo
+ * sobreviviría (lo pinta el gemelo en anthropic-toolcall-salvage: "strip-before-tags keeps
+ * offsets honest").
+ *
+ * Va DENTRO de la guarda `spans.length > 0` por la misma razón que en el gemelo ("零残渣轮
+ * 逐字节保持今天的交付"): una ronda sin residuo se entrega byte a byte como hoy. Pelar
+ * etiquetas siempre además rompería el descuento de handleOpenAIAgentStream —
+ * `acceptedVisibleText.startsWith(streamedVisibleText)`— cuando una etiqueta anidada ya salió
+ * en vivo SIN pelar, y el turno entero se reenviaría detrás de ella. Por eso los dos únicos
+ * llamadores (el contenido y el descuento) comparten esta función: si divergen, se duplica.
+ */
+const peelDeliverableText = (rawText, spans) => {
+    const text = String(rawText || '')
+    if (!Array.isArray(spans) || spans.length === 0) return text
+    return stripAgentTags(stripToolCallResidue(text, spans))
+}
+
+const prepareAgentOutput = async (attempt, enableThinking, enableWebSearch, { suppressVisibleText = false, residueSpans = null } = {}) => {
     let reasoning = String(attempt?.reasoning || '')
-    let content = attempt?.toolCalls?.length > 0 ? '' : String(attempt?.visibleText || '')
+    // 工具调用旁的正文照常交付（OpenAI 允许 content 与 tool_calls 并存）：严格门禁下文本
+    // 通道的调用到这里 visibleText 必为空白；原生晋升的回合带着调用前的正文过来 —— 除非
+    // 门禁判定那段正文混着写坏的文本 [TOOL CALL]（suppressVisibleText），那就一个字节不发。
+    //
+    // 交付层剥残渣（与 anthropic.js:1501/:2164 同一层）：解析器**当场登记**的协议残渣按
+    // 位置剥掉，绝不搜索 —— 围栏里引用同一个标记的文档不带 span，原样交付。检测输入
+    // （attempt.visibleText）从未被碰过：malformed_protocol 重试仍照旧点火。
+    const rawVisibleText = String(attempt?.visibleText || '')
+    const spans = residueSpans || deliverableResidueSpans(attempt)
+    const visibleText = suppressVisibleText ? '' : peelDeliverableText(rawVisibleText, spans)
+    // Juicio de pureza de residuo (gemelo de anthropic.js:2269 `residueOnlyTurn`). El pelado
+    // ya corrió, así que `visibleText` ES el texto que iría al cliente: si la ronda entera era
+    // residuo condenado, lo que queda es vacío y esta ronda pertenece a la misma clase de
+    // fallo que una con tool_errors → error, JAMÁS un 200 con `content: ""` (frozen matrix:
+    // never an empty-content message / raw protocol never reaches a client). Se exige que el
+    // texto PRE-pelado tuviera cuerpo: así el veredicto culpa al pelado y no se solapa con las
+    // rondas que ya estaban vacías por otras razones, que tienen su propio camino.
+    const residueOnly = !suppressVisibleText &&
+        spans.length > 0 &&
+        !(attempt?.toolCalls?.length > 0) &&
+        !!rawVisibleText.trim() &&
+        !visibleText.trim()
+    let content = attempt?.toolCalls?.length > 0 && !visibleText.trim() ? '' : visibleText
 
     if (attempt?.webSearchInfo) {
         const table = await accountManager.generateMarkdownTable(attempt.webSearchInfo, config.searchInfoMode)
@@ -256,7 +363,26 @@ const prepareAgentOutput = async (attempt, enableThinking, enableWebSearch) => {
         content = `<think>\n\n${reasoning}\n\n</think>${content ? `\n${content}` : ''}`
         reasoning = ''
     }
-    return { reasoning, content }
+    return { reasoning, content, residueOnly }
+}
+
+/**
+ * Error de entrega para la ronda 100% residuo. Misma clase de fallo que el gemelo
+ * (anthropic.js:2307 -> 502 `invalid_tool_call_error`), con la forma que este camino ya usa:
+ * `writeOpenAIHttpError` emite JSON si aun no salieron cabeceras y un evento de error SSE si
+ * ya salieron -- el mismo mecanismo por el que viaja el 422 del gate.
+ */
+const RESIDUE_ONLY_DETAIL = '整轮内容只有协议残渣，剥离后为空'
+const writeResidueOnlyError = (res, label) => {
+    logger.warn(
+        `OpenAI ${label} Agent 工具协议失败，放弃交付 (${RESIDUE_ONLY_DETAIL})`,
+        'AGENT'
+    )
+    writeOpenAIHttpError(res, {
+        status: 502,
+        message: `上游返回了残缺、非法或不存在的工具调用 (${RESIDUE_ONLY_DETAIL})`,
+        code: 'invalid_tool_call'
+    })
 }
 
 const handleOpenAIAgentStream = async (
@@ -321,17 +447,19 @@ const handleOpenAIAgentStream = async (
                 requestBody,
                 sendChatRequest: options.sendChatRequest || sendChatRequest,
                 on_reasoning_delta: onReasoningDelta,
-                on_content_delta: onContentDelta
+                on_content_delta: onContentDelta,
+                isClientDisconnected: () => res.destroyed || res.writableEnded
             }),
             options.agent_processing_heartbeat_ms
         )
     } catch (error) {
         logger.error('OpenAI Agent 回合处理失败', 'AGENT', '', error)
-        writeOpenAIHttpError(res, {
-            status: 502,
-            message: error.publicMessage || '上游 Agent 回合处理失败',
-            code: error.code || 'upstream_stream_error'
-        })
+        if (!error.accountFailureRecorded) {
+            noteRateLimitedAccount(error, error.failedAccountEmail ? { email: error.failedAccountEmail } : options.currentAccount)
+        }
+        writeOpenAIHttpError(res, upstreamErrorShape(
+            error, '上游 Agent 回合处理失败', 'upstream_stream_error'
+        ))
         return
     }
     if (!runtime.ok) {
@@ -339,8 +467,21 @@ const handleOpenAIAgentStream = async (
         return
     }
 
-    const { attempt, finishReason } = runtime
-    const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch)
+    const { attempt, finishReason, suppressVisibleText } = runtime
+    const streamedVisibleText = String(attempt.streamedVisibleText || '')
+    // Un único juego de spans para el contenido y para el descuento de abajo: si se pelara
+    // el buffer contra un `acceptedVisibleText` sin pelar, el `startsWith` fallaría y el
+    // turno entero se reenviaría detrás de lo ya emitido.
+    const residueSpans = deliverableResidueSpans(attempt, streamedVisibleText.length)
+    const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch, { suppressVisibleText, residueSpans })
+    // Gemelo de la guarda no-streaming: la ronda entera era residuo condenado y el pelado la
+    // dejó vacía → falla, no un `finish_reason: stop` sin un solo delta de contenido. Sólo
+    // cuando NADA salió aún por el canal de contenido: si ya se emitió texto en vivo, el
+    // cliente tiene media respuesta y el 422 del gate es quien cubre ese caso.
+    if (output.residueOnly && !streamedVisibleText) {
+        writeResidueOnlyError(res, '流式')
+        return
+    }
     let bufferedReasoning = output.reasoning
     const acceptedReasoningWasStreamed = liveReasoningByAttempt.has(runtime.attempts)
     const rawAcceptedReasoning = String(attempt.reasoning || '')
@@ -351,8 +492,7 @@ const handleOpenAIAgentStream = async (
     }
 
     let bufferedContent = output.content
-    const streamedVisibleText = String(attempt.streamedVisibleText || '')
-    const acceptedVisibleText = String(attempt.visibleText || '')
+    const acceptedVisibleText = peelDeliverableText(attempt.visibleText, residueSpans)
     if (
         streamedVisibleText &&
         acceptedVisibleText.startsWith(streamedVisibleText) &&
@@ -392,7 +532,7 @@ const handleOpenAIAgentStream = async (
     }
     const completionText = `${output.reasoning}${output.content}${JSON.stringify(attempt.toolCalls || [])}`
     const usage = normalizeAgentUsage(attempt, requestBody, completionText)
-    attributeChatUsage(options.currentAccount, usage)
+    attributeChatUsage(runtime.currentAccount || options.currentAccount, usage)
     res.write(`data: ${JSON.stringify({
         id: `chatcmpl-${messageId}`,
         object: 'chat.completion.chunk',
@@ -427,17 +567,17 @@ const handleOpenAIAgentNonStream = async (
             () => runOpenAIAgentTurn(response, {
                 ...options,
                 requestBody,
-                sendChatRequest: options.sendChatRequest || sendChatRequest
+                sendChatRequest: options.sendChatRequest || sendChatRequest,
+                isClientDisconnected: () => res.destroyed || res.writableEnded
             }),
             options.agent_processing_heartbeat_ms
         )
     } catch (error) {
         logger.error('OpenAI 非流式 Agent 回合处理失败', 'AGENT', '', error)
-        writeOpenAIHttpError(res, {
-            status: 502,
-            message: error.publicMessage || '上游 Agent 回合处理失败',
-            code: error.code || 'upstream_error'
-        })
+        if (!error.accountFailureRecorded) {
+            noteRateLimitedAccount(error, error.failedAccountEmail ? { email: error.failedAccountEmail } : options.currentAccount)
+        }
+        writeOpenAIHttpError(res, upstreamErrorShape(error, '上游 Agent 回合处理失败'))
         return
     }
     if (!runtime.ok) {
@@ -446,8 +586,14 @@ const handleOpenAIAgentNonStream = async (
     }
 
     setResponseHeaders(res, false)
-    const { attempt, finishReason } = runtime
-    const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch)
+    const { attempt, finishReason, suppressVisibleText } = runtime
+    const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch, { suppressVisibleText })
+    // Un turno cuyo cuerpo entero era residuo condenado no tiene nada que entregar: 502 de la
+    // misma clase que el gemelo (anthropic.js:2269), nunca un 200 con `content: ""`.
+    if (output.residueOnly) {
+        writeResidueOnlyError(res, '非流式')
+        return
+    }
     const assistantMessage = {
         role: 'assistant',
         content: output.content || (attempt.toolCalls.length > 0 ? null : '')
@@ -462,7 +608,7 @@ const handleOpenAIAgentNonStream = async (
     }
     const completionText = `${output.reasoning}${output.content}${JSON.stringify(attempt.toolCalls || [])}`
     const usage = normalizeAgentUsage(attempt, requestBody, completionText)
-    attributeChatUsage(options.currentAccount, usage)
+    attributeChatUsage(runtime.currentAccount || options.currentAccount, usage)
     res.json({
         id: `chatcmpl-${generateUUID()}`,
         object: 'chat.completion',
@@ -498,10 +644,14 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         const requestSender = options.sendChatRequest || sendChatRequest
         const toolChoice = options.tool_choice
         const allowedToolNames = options.allowed_tool_names || []
-        const toolParser = hasTools ? createToolCallStreamParser({ allowedToolNames }) : null
+        const isClientToolName = createClientToolNamePredicate(allowedToolNames)
+        let toolParser = hasTools ? createToolCallStreamParser({ allowedToolNames }) : null
         let nativeToolAccumulator = hasTools
             ? createNativeToolCallAccumulator({ allowedToolNames })
             : null
+        // 调用方持有唯一的单调 index：文本解析器与原生累积器各自从 0 计数，直接透传会让
+        // 两路都写 tool_calls[0]。
+        let nextToolCallIndex = 0
         let upstreamFinishReason = null
         let upstreamCompleted = false
         let upstreamEventCount = 0
@@ -595,6 +745,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             const ARG_CHUNK_SIZE = 32
 
             for (const call of calls) {
+                const index = nextToolCallIndex++
                 const headerDelta = {
                     "id": `chatcmpl-${message_id}`,
                     "object": "chat.completion.chunk",
@@ -605,7 +756,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                             "delta": {
                                 "tool_calls": [
                                     {
-                                        "index": call.index,
+                                        "index": index,
                                         "id": call.id,
                                         "type": "function",
                                         "function": {
@@ -634,7 +785,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                                 "delta": {
                                     "tool_calls": [
                                         {
-                                            "index": call.index,
+                                            "index": index,
                                             "function": { "arguments": piece }
                                         }
                                     ]
@@ -676,14 +827,9 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             }
 
             const delta = choice.delta || {}
-            if (nativeToolAccumulator && Array.isArray(delta.tool_calls)) {
-                nativeToolAccumulator.push(delta.tool_calls)
-            } else if (nativeToolAccumulator && delta.function_call) {
-                nativeToolAccumulator.push([{
-                    index: 0,
-                    type: 'function',
-                    function: delta.function_call
-                }])
+            if (nativeToolAccumulator) {
+                // 关闭即判定；发射仍在回合尾部 finalize()（旧路径没有中途排放，drain 为空操作）。
+                feedNativeFrame(nativeToolAccumulator, delta, reportedFinishReason, { isClientToolName, drain: () => {} })
             }
 
             if (delta && delta.name === 'web_search') {
@@ -826,7 +972,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                 ? buildRequiredRetryHint(toolChoice)
                 : (needsMissingToolRetry ? buildMissingToolRetryHint() : buildEmptyOutputRetryHint())
             const retryBody = appendRetryHintToRequestBody(requestBody, retryHint)
-            logger.warning?.(
+            logger.warn(
                 needsRequiredRetry
                     ? 'tool_choice=required 首次未触发工具调用，进行一次重试'
                     : (needsMissingToolRetry
@@ -835,8 +981,16 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                 'CHAT'
             )
             try {
-                const retryResp = await requestSender(retryBody)
+                // Mismas opciones que la peticion original: sin ellas el reenvio no puede
+                // compactar ni reutilizar el prefijo de historial y quema un parse mas.
+                const retryResp = await requestSender(retryBody, options.upstreamOptions || {})
                 if (retryResp.status && retryResp.response) {
+                    // 与非流式分支同一条：重试是新的回合，解析器与累积器都重建，第一轮的残片
+                    // 不能漂进第二轮（其余消费者本来就按 attempt 重建）。
+                    if (hasTools) {
+                        toolParser = createToolCallStreamParser({ allowedToolNames })
+                        nativeToolAccumulator = createNativeToolCallAccumulator({ allowedToolNames })
+                    }
                     upstreamFinishReason = null
                     await pipeUpstream(retryResp.response)
                 }
@@ -943,20 +1097,32 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         res.end()
     } catch (error) {
         logger.error('聊天处理错误', 'CHAT', '', error)
+        // Cuota agotada -> 429 `insufficient_quota`; adjunto caido -> 503 (529 es de
+        // Anthropic); cualquier otro fallo conserva su etiqueta de siempre. Deteccion
+        // unica en utils/upstream-error.js.
+        const failure = describeUpstreamFailure(error, 502, 503)
+        noteRateLimitedAccount(error, options.currentAccount)
         if (res.headersSent) {
             if (!res.writableEnded) {
                 writeOpenAIStreamError(
                     res,
                     error.publicMessage || '上游流式传输失败',
-                    error.publicMessage ? error.code : 'upstream_stream_error'
+                    failure.rateLimited
+                        ? RATE_LIMIT_OPENAI_TYPE
+                        : (error.publicMessage ? error.code : 'upstream_stream_error'),
+                    failure.rateLimited ? RATE_LIMIT_OPENAI_TYPE : 'upstream_stream_error',
+                    failure.retryAfter
                 )
             }
         } else {
-            res.status(502).json({
+            if (failure.retryAfter !== null) res.set({ 'Retry-After': String(failure.retryAfter) })
+            res.status(failure.status).json({
                 error: {
                     message: error.publicMessage || '上游流式传输失败',
-                    type: 'upstream_stream_error',
-                    code: error.code || 'upstream_stream_error'
+                    type: failure.rateLimited ? RATE_LIMIT_OPENAI_TYPE : 'upstream_stream_error',
+                    code: failure.rateLimited
+                        ? RATE_LIMIT_OPENAI_TYPE
+                        : (error.code || 'upstream_stream_error')
                 }
             })
         }
@@ -1001,6 +1167,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         const requestSender = options.sendChatRequest || sendChatRequest
         const toolChoice = options.tool_choice
         const allowedToolNames = options.allowed_tool_names || []
+        const isClientToolName = createClientToolNamePredicate(allowedToolNames)
         let nativeToolAccumulator = hasTools
             ? createNativeToolCallAccumulator({ allowedToolNames })
             : null
@@ -1055,10 +1222,9 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
                 upstreamFinishReason = reportedFinishReason
             }
             const delta = choice.delta || {}
-            if (nativeToolAccumulator && Array.isArray(delta.tool_calls)) {
-                nativeToolAccumulator.push(delta.tool_calls)
-            } else if (nativeToolAccumulator && delta.function_call) {
-                nativeToolAccumulator.push([{ index: 0, type: 'function', function: delta.function_call }])
+            if (nativeToolAccumulator) {
+                // 关闭即判定；结算在回合尾部 finalize()（drain 为空操作）。
+                feedNativeFrame(nativeToolAccumulator, delta, reportedFinishReason, { isClientToolName, drain: () => {} })
             }
 
             if (delta.name === 'web_search') {
@@ -1169,7 +1335,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
                 ? buildRequiredRetryHint(toolChoice)
                 : (needsMissingToolRetry ? buildMissingToolRetryHint() : buildEmptyOutputRetryHint())
             const retryBody = appendRetryHintToRequestBody(requestBody, retryHint)
-            logger.warning?.(
+            logger.warn(
                 needsRequiredRetry
                     ? 'tool_choice=required 首次未触发工具调用，进行一次重试'
                     : (needsMissingToolRetry
@@ -1178,7 +1344,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
                 'CHAT'
             )
             try {
-                const retryResp = await requestSender(retryBody)
+                const retryResp = await requestSender(retryBody, options.upstreamOptions || {})
                 if (retryResp.status && retryResp.response) {
                     const before = fullContent
                     nativeToolAccumulator = createNativeToolCallAccumulator({ allowedToolNames })
@@ -1298,12 +1464,15 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         res.json(bodyTemplate)
     } catch (error) {
         logger.error('非流式聊天处理错误', 'CHAT', '', error)
+        const failure = describeUpstreamFailure(error, 502, 503)
+        noteRateLimitedAccount(error, options.currentAccount)
         if (!res.headersSent) {
-            res.status(502).json({
+            if (failure.retryAfter !== null) res.set({ 'Retry-After': String(failure.retryAfter) })
+            res.status(failure.status).json({
                 error: {
                     message: error.publicMessage || '上游响应处理失败',
-                    type: 'upstream_error',
-                    code: error.code || 'upstream_error'
+                    type: failure.rateLimited ? RATE_LIMIT_OPENAI_TYPE : 'upstream_error',
+                    code: failure.rateLimited ? RATE_LIMIT_OPENAI_TYPE : (error.code || 'upstream_error')
                 }
             })
         }
@@ -1323,7 +1492,23 @@ const handleChatCompletion = async (req, res) => {
     const enable_web_search = req.enable_web_search
 
     try {
-        const response_data = await sendChatRequest(req.body)
+        // Gemelo de anthropic.js: compactar solo sin tools; con tools el fallo del
+        // adjunto sale como 503 reintentable (catch de abajo). La clave de sesion permite
+        // reutilizar el prefijo de historial ya subido (utils/context-prefix-cache.js);
+        // sin ella cada turno largo sube y parsea el historial entero. Las MISMAS opciones
+        // viajan en los reenvios de correccion (upstreamOptions).
+        const requestMessages = Array.isArray(req.body.messages) ? req.body.messages : []
+        const upstreamOptions = {
+            allowContextCompaction: req.has_tools !== true,
+            contextPrefixKey: buildContextPrefixKey({
+                userId: req.body.user,
+                model,
+                system: requestMessages.find(message => message?.role === 'system')?.content ?? '',
+                tools: req.body.tools,
+                firstMessage: requestMessages.find(message => message?.role !== 'system') ?? null
+            })
+        }
+        const response_data = await sendChatRequest(req.body, upstreamOptions)
 
         if (!response_data.status || !response_data.response) {
             res.status(500)
@@ -1333,13 +1518,27 @@ const handleChatCompletion = async (req, res) => {
             return
         }
 
+    // Aviso al cliente cuando el contexto se recortó en silencio. El fallback por fallo
+    // del adjunto deja pasar un 200 con una fracción del contexto original: sin esta
+    // cabecera el cliente cree que el modelo lo vio todo. Convención existente:
+    // anthropic.compatibility.js#X-Qwen2API-Anthropic-Warnings.
+        if (response_data.contextCompacted) {
+            res.set('X-Qwen2API-Context-Compacted', String(response_data.contextSerializedBytes || 0))
+        }
+
         if (stream) {
             setResponseHeaders(res, true)
             await handleStreamResponse(res, response_data.response, enable_thinking, enable_web_search, req.body, {
                 has_tools: req.has_tools,
                 tool_choice: req.tool_choice,
                 allowed_tool_names: req.allowed_tool_names,
+                // Puertas de schema del parser (reparacion de comillas / aceptacion tras
+                // prosa). Sin esto ambas fallan cerradas en el runtime de Agent.
+                tool_schemas: req.tool_schemas,
+                // Semilla del ledger de deduplicacion (chat-middleware.js). Informa, no suprime.
+                tool_history_calls: req.tool_history_calls,
                 currentAccount: response_data.currentAccount,
+                upstreamOptions,
                 upstream_request_body: response_data.requestBody,
                 upstream_context: {
                     chatId: response_data.chatId,
@@ -1352,7 +1551,13 @@ const handleChatCompletion = async (req, res) => {
                 has_tools: req.has_tools,
                 tool_choice: req.tool_choice,
                 allowed_tool_names: req.allowed_tool_names,
+                // Puertas de schema del parser (reparacion de comillas / aceptacion tras
+                // prosa). Sin esto ambas fallan cerradas en el runtime de Agent.
+                tool_schemas: req.tool_schemas,
+                // Semilla del ledger de deduplicacion (chat-middleware.js). Informa, no suprime.
+                tool_history_calls: req.tool_history_calls,
                 currentAccount: response_data.currentAccount,
+                upstreamOptions,
                 upstream_request_body: response_data.requestBody,
                 upstream_context: {
                     chatId: response_data.chatId,
@@ -1363,6 +1568,18 @@ const handleChatCompletion = async (req, res) => {
 
     } catch (error) {
         logger.error('聊天处理错误', 'CHAT', '', error)
+        // Adjunto de contexto caido con tools: 503 reintentable (gemelo del 529 de
+        // anthropic.js). Cualquier otra cosa conserva el 500 de siempre.
+        const failure = describeUpstreamFailure(error, 500, 503)
+        if (failure.overloaded) {
+            return writeOpenAIHttpError(res, {
+                status: failure.status,
+                message: error.publicMessage || 'Upstream context attachment unavailable; retry',
+                type: 'server_error',
+                code: 'upstream_unavailable',
+                retry_after: failure.retryAfter
+            })
+        }
         res.status(500)
             .json({
                 error: "Invalid token, request failed"

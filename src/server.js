@@ -4,8 +4,8 @@ const config = require('./config/index.js')
 const cors = require('cors')
 const Tokens = require('csrf')
 const { logger } = require('./utils/logger')
-const { initSsxmodManager } = require('./utils/ssxmod-manager')
 const DataPersistence = require('./utils/data-persistence')
+const persistedSettings = require('./utils/persisted-settings')
 const app = express()
 const path = require('path')
 const fs = require('fs')
@@ -17,15 +17,18 @@ const anthropicRouter = require('./routes/anthropic.js')
 const verifyRouter = require('./routes/verify.js')
 const accountsRouter = require('./routes/accounts.js')
 const settingsRouter = require('./routes/settings.js')
+const { resolveRuntimePath } = require('./utils/runtime-paths')
+const { mountFrontend } = require('./utils/frontend.js')
 
 if (config.dataSaveMode === 'file') {
-  if (!fs.existsSync(path.join(__dirname, '../data/data.json'))) {
-    fs.writeFileSync(path.join(__dirname, '../data/data.json'), JSON.stringify({"accounts": [] }, null, 2))
+  const dataFilePath = resolveRuntimePath('data', 'data.json')
+  fs.mkdirSync(path.dirname(dataFilePath), { recursive: true })
+  if (!fs.existsSync(dataFilePath)) {
+    fs.writeFileSync(dataFilePath, JSON.stringify({"accounts": [] }, null, 2))
   }
 }
 
-// 初始化 SSXMOD Cookie 管理器
-initSsxmodManager()
+// SSXMOD initialization is now lazy (per-account); no startup side effect
 
 app.use(bodyParser.json({ limit: '128mb' }))
 app.use(bodyParser.urlencoded({ limit: '128mb', extended: true }))
@@ -53,6 +56,18 @@ const csrfProtect = (req, res, next) => {
   const secret = req.headers['x-csrf-secret']
   const token = req.headers['x-csrf-token']
   if (secret && token && csrfTokens.verify(secret, token)) return next()
+  // Anthropic-compatible error schema for Claude Code clients.
+  // Match authorization.js heuristic: x-api-key header or /v1/messages path.
+  // Accept header not required (curl tests and some SDK versions omit it).
+  const isAnthropicClient = !!(
+    req.headers['x-api-key'] || req.path?.startsWith('/v1/messages')
+  )
+  if (isAnthropicClient) {
+    return res.status(403).json({
+      type: 'error',
+      error: { type: 'invalid_request_error', message: 'Invalid CSRF token' }
+    })
+  }
   return res.status(403).json({ error: 'Invalid CSRF token' })
 }
 app.use(csrfProtect)
@@ -66,16 +81,7 @@ app.use(verifyRouter)
 app.use('/api', accountsRouter)
 app.use('/api', settingsRouter)
 
-app.use(express.static(path.join(__dirname, '../public/dist')))
-
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, '../public/dist/index.html'), (err) => {
-    if (err) {
-      logger.error('管理页面加载失败', 'SERVER', '', err)
-      res.status(500).send('服务器内部错误')
-    }
-  })
-})
+mountFrontend(app)
 
 // 处理错误中间件（必须放在所有路由之后）
 app.use((err, req, res, next) => {
@@ -101,37 +107,29 @@ const serverInfo = {
 const applyPersistedSettings = async () => {
   try {
     const persisted = await new DataPersistence().loadSettings()
-    if (persisted.chatRetryCount !== undefined && persisted.chatRetryCount !== '') {
-      const v = parseInt(persisted.chatRetryCount, 10)
-      if (!isNaN(v) && v >= 0) config.chatRetryCount = v
-    }
-    if (persisted.chatRetryBackoffMs !== undefined && persisted.chatRetryBackoffMs !== '') {
-      const v = parseInt(persisted.chatRetryBackoffMs, 10)
-      if (!isNaN(v) && v >= 0) config.chatRetryBackoffMs = v
-    }
-    if (persisted.apiKeys?.length > 1) {
-      config.apiKeys = persisted.apiKeys;
-      config.adminKey = persisted.apiKeys[0];
-    }
+    persistedSettings.applyPersistedSettings(config, persisted)
   } catch (err) {
     logger.warn('加载持久化设置失败, 使用 env/默认值', 'CONFIG', '', err.message)
   }
 }
 
 const startServer = () => {
-  if (config.listenAddress) {
-    app.listen(config.listenPort, config.listenAddress, () => {
-      logger.server('服务器启动成功', 'SERVER', serverInfo)
-      logger.info('开源地址: https://github.com/Rfym21/Qwen2API', 'INFO')
-      logger.info('电报群聊: https://t.me/nodejs_project', 'INFO')
+  const server = app.listen(config.listenPort, config.listenAddress || undefined, () => {
+    logger.server('服务器启动成功', 'SERVER', serverInfo)
+    logger.info('开源地址: https://github.com/Rfym21/Qwen2API', 'INFO')
+    logger.info('电报群聊: https://t.me/nodejs_project', 'INFO')
+  })
+
+  // Bun is PID 1 in Docker. Drain requests, but bound shutdown for long-lived SSE.
+  process.once('SIGTERM', () => {
+    const shutdownTimer = setTimeout(() => process.exit(1), 8000)
+    shutdownTimer.unref()
+    server.close(() => {
+      clearTimeout(shutdownTimer)
+      process.exit(0)
     })
-  } else {
-    app.listen(config.listenPort, () => {
-      logger.server('服务器启动成功', 'SERVER', serverInfo)
-      logger.info('开源地址: https://github.com/Rfym21/Qwen2API', 'INFO')
-      logger.info('电报群聊: https://t.me/nodejs_project', 'INFO')
-    })
-  }
+    server.closeIdleConnections()
+  })
 }
 
 applyPersistedSettings().finally(startServer)

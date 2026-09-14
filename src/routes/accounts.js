@@ -5,7 +5,7 @@ const accountManager = require('../utils/account')
 const { logger } = require('../utils/logger')
 const { JwtDecode } = require('../utils/tools')
 const { adminKeyVerify } = require('../middlewares/authorization')
-const { deleteAccount, saveAccounts, refreshAccountToken } = require('../utils/setting')
+const { deleteAccount, saveAccounts } = require('../utils/setting')
 const { parseAccountLine, splitAccountEntries } = require('../utils/account-parser')
 const { isValidProxyUrl } = require('../utils/proxy-helper')
 const { DEFAULT_CLI_QUOTA_LIMIT, getAccountCliState } = require('../utils/cli-support')
@@ -740,8 +740,8 @@ router.get('/statsHistory', adminKeyVerify, async (req, res) => {
  * smoke-testing the storage layer).
  *
  * Registered ONLY when ENABLE_STATS_DEBUG_ARCHIVE === 'true'.
- * NODE_ENV is intentionally NOT used — this repo does not set it
- * (src/start.js, ecosystem.config.js), so 'production' cannot be guaranteed.
+ * NODE_ENV is intentionally NOT used: debug access must be explicitly enabled
+ * regardless of the runtime or deployment environment.
  *
  * In any normal (including production) configuration the route is absent —
  * POST returns 404. Caveat: GET on any unknown path falls into app.get('*')
